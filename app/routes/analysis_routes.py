@@ -1,8 +1,8 @@
-from flask import Blueprint, request, jsonify, current_app, url_for, abort  # type: ignore # Added abort
-from ..tasks import run_full_analysis
+from flask import Blueprint, request, jsonify, current_app, url_for, abort  # type: ignore
 from celery.result import AsyncResult  # type: ignore
-from ..models import db, Conversation, AnalysisResult
 from sqlalchemy import or_  # type: ignore
+from ..tasks import run_full_analysis
+from ..models import db, Conversation, AnalysisResult
 
 analysis_bp = Blueprint("analysis_bp", __name__)
 
@@ -14,9 +14,9 @@ def list_conversations():
         per_page = request.args.get("per_page", 10, type=int)
         if page <= 0 or per_page <= 0:
             abort(400, description="Page and per_page must be positive integers.")
-        if per_page > 100:  # Max limit for per_page
+        if per_page > 100:
             per_page = 100
-    except ValueError:  # Handle cases where type=int fails for non-integer strings
+    except ValueError:
         abort(400, description="Page and per_page must be integers.")
 
     status_filter = request.args.get("status", type=str)
@@ -47,9 +47,7 @@ def list_conversations():
         query = query.filter(Conversation.language == lang_filter.lower())
 
     try:
-        paginated_conversations = query.paginate(
-            page, per_page, error_out=False
-        )  # error_out=False prevents 404 on empty page
+        paginated_conversations = query.paginate(page, per_page, error_out=False)
     except Exception as e:  # Catch potential pagination errors not covered by aborts
         current_app.logger.error(f"Pagination query error: {e}")
         abort(500, description="Error during data retrieval.")
@@ -109,7 +107,6 @@ def get_conversation_details(conversation_identifier):
     if not conversation:
         abort(404, description="Conversation not found.")
 
-    # Ensure c.upload_timestamp is used in isoformat(), not the loop variable from list_conversations
     upload_ts_iso = (
         conversation.upload_timestamp.isoformat()
         if conversation.upload_timestamp
@@ -217,9 +214,8 @@ def get_specific_analysis_result(conversation_identifier, analysis_type):
             description=f"Invalid analysis type '{analysis_type}'. Valid types: {valid_types}",
         )
 
-    specific_result = full_results_payload.get(
-        actual_key_found
-    )  # Use the found actual key
+    # Use the found actual key
+    specific_result = full_results_payload.get(actual_key_found)
 
     return (
         jsonify(
@@ -235,7 +231,7 @@ def get_specific_analysis_result(conversation_identifier, analysis_type):
     )
 
 
-# --- Task Management Endpoints (largely same, rely on app error handlers) ---
+# --- Task Management Endpoints (rely on app error handlers) ---
 @analysis_bp.route("/api/analyze/<file_id>", methods=["POST"])
 def start_analysis_task(file_id):
     if ".." in file_id or "/" in file_id:
@@ -294,7 +290,6 @@ def start_analysis_task(file_id):
 
 @analysis_bp.route("/api/analysis_status/<task_id>", methods=["GET"])
 def get_task_status(task_id):
-    # (Logic largely same, error handling for not found conversation is now handled by abort(404) or similar)
     conversation = Conversation.query.filter_by(celery_task_id=task_id).first()
     db_status = conversation.status.value if conversation else "TASK_ID_NOT_IN_DB"
 

@@ -1,13 +1,12 @@
-from flask import Flask, request, jsonify  # type: ignore
 import os
 import uuid
-import logging  # For more detailed logging configuration
-
+import logging
+from flask import Flask, request, jsonify  # type: ignore
+from flask_cors import CORS  # type: ignore
+from flask_talisman import Talisman  # type: ignore
 from sqlalchemy import text  # type: ignore
 from .celery_app import init_celery
 from .models import db, Conversation
-from flask_cors import CORS  # type: ignore # Import CORS
-from flask_talisman import Talisman  # type: ignore # Import Talisman
 
 ALLOWED_EXTENSIONS = {"txt", "json", "csv"}
 SUPPORTED_LANGUAGES = ["en", "es"]
@@ -48,9 +47,7 @@ def create_app(config_name=None):
         == "production",  # Force HTTPS if in production (behind a proxy usually)
         "strict_transport_security": os.environ.get("FLASK_ENV") == "production",
         "session_cookie_secure": os.environ.get("FLASK_ENV") == "production",
-        # "session_cookie_httponly": True,
-        "frame_options": "DENY",  # Or 'SAMEORIGIN'
-        # "content_type_nosniff": True,
+        "frame_options": "DENY",
     }
     Talisman(app, **talisman_options)
 
@@ -123,9 +120,8 @@ def create_app(config_name=None):
             db_status = "OK"
         except Exception as e:
             db_status = f"Error: {str(e)}"
-        return jsonify(
-            status="OK", database=db_status, redis_ping="PONG"
-        )  # Basic Redis check can be added if needed by pinging celery broker
+        # Basic Redis check can be added if needed by pinging celery broker
+        return jsonify(status="OK", database=db_status, redis_ping="PONG")
 
     @app.route("/api/upload", methods=["POST"])
     def upload_file():

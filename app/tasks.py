@@ -1,3 +1,5 @@
+import os
+from flask import current_app  # type: ignore
 from .celery_app import celery
 from .services.analysis_service import (
     extract_speaker_statistics,
@@ -7,13 +9,7 @@ from .services.analysis_service import (
     calculate_persuasion_scores_heuristic,
     detect_fallacies_and_manipulation_heuristic,
 )
-from .models import (
-    db,
-    Conversation,
-    AnalysisResult,
-)  # Import db and models
-import os
-from flask import current_app  # type: ignore
+from .models import db, Conversation, AnalysisResult
 
 
 @celery.task(bind=True)

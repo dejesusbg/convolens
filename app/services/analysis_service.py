@@ -2,12 +2,12 @@ import re
 import json
 import csv
 from collections import Counter, defaultdict
-import os  # For os.path.basename
-import nltk  # Import NLTK
+import os
+import nltk
 
 nltk.data.clear_cache()
 
-import text2emotion as te  # type: ignore # Import text2emotion
+import text2emotion as te  # type: ignore
 
 
 def get_speaker_from_line_txt(line):
@@ -19,9 +19,7 @@ def get_speaker_from_line_txt(line):
     # Fallback for lines that might just be "SpeakerName:text" without strict pattern
     if ":" in line:
         possible_speaker = line.split(":", 1)[0].strip()
-        if (
-            len(possible_speaker) < 50 and not possible_speaker.isdigit()
-        ):  # Basic filter
+        if len(possible_speaker) < 50 and not possible_speaker.isdigit():
             return possible_speaker
     return None
 
@@ -32,7 +30,7 @@ def get_speaker_from_json_item(item):
         keys_to_check = ["speaker", "user", "author", "name", "user_id"]
         for key in keys_to_check:
             if key in item and item[key]:
-                return str(item[key])  # Ensure speaker is string
+                return str(item[key])
     return None
 
 
@@ -40,7 +38,7 @@ def get_speaker_from_csv_row(row, fieldnames):
     """Helper to extract speaker from a CSV row (dict)."""
     speaker_col_names = ["speaker", "user", "author", "speaker_id", "from", "name"]
     actual_speaker_col = None
-    if fieldnames:  # fieldnames should be from DictReader
+    if fieldnames:
         for name_actual in fieldnames:
             for name_potential in speaker_col_names:
                 if name_potential.lower() == name_actual.lower():
@@ -50,7 +48,7 @@ def get_speaker_from_csv_row(row, fieldnames):
                 break
 
     if actual_speaker_col and actual_speaker_col in row and row[actual_speaker_col]:
-        return str(row[actual_speaker_col])  # Ensure speaker is string
+        return str(row[actual_speaker_col])
 
     # Fallback if specific column not found but it's a plain CSV reader row (list)
     if not actual_speaker_col and isinstance(row, list) and row:
@@ -61,10 +59,10 @@ def get_speaker_from_csv_row(row, fieldnames):
             and ":" not in possible_speaker
         ):
             return possible_speaker
-    elif (
-        isinstance(row, dict) and not actual_speaker_col
-    ):  # If it's a dict but our named cols weren't found
-        # Try the first value if it looks like a speaker (heuristic)
+
+    # If it's a dict but our named cols weren't found
+    # Try the first value if it looks like a speaker (heuristic)
+    elif isinstance(row, dict) and not actual_speaker_col:
         if row:
             first_key = list(row.keys())[0]
             possible_speaker = str(row[first_key]).strip()
@@ -240,13 +238,13 @@ def identify_speakers_from_csv(filepath):
         with open(filepath, "r", encoding="utf-8", newline="") as f:
             temp_f_for_sniffer = open(filepath, "r", encoding="utf-8", newline="")
             try:
-                has_header = csv.Sniffer().has_header(
-                    temp_f_for_sniffer.read(2048)
-                )  # Read more bytes for sniffer
-            except (
-                csv.Error
-            ):  # Sniffer can fail on perfectly valid CSVs if it's confused
+                # Read more bytes for sniffer
+                has_header = csv.Sniffer().has_header(temp_f_for_sniffer.read(2048))
+
+            # Sniffer can fail on perfectly valid CSVs if it's confused
+            except csv.Error:
                 has_header = True  # Assume header if sniffer fails, common case
+
             temp_f_for_sniffer.close()
             f.seek(0)
 
@@ -329,13 +327,11 @@ def extract_text_from_file(filepath):
                     if not line_content:
                         continue
                     match = re.match(r"^\s*([\w\s.-]+?)\s*[:]\s*(.*)", line_content)
-                    if (
-                        match and match.group(2).strip()
-                    ):  # Ensure text part is not empty
+                    # Ensure text part is not empty
+                    if match and match.group(2).strip():
                         texts.append(match.group(2).strip())
-                    elif (
-                        not match and line_content
-                    ):  # No speaker tag, assume whole line is text
+                    # No speaker tag, assume whole line is text
+                    elif not match and line_content:
                         texts.append(line_content)
 
         elif filename.endswith(".json"):
@@ -367,7 +363,7 @@ def extract_text_from_file(filepath):
                             "content",
                             "utterance",
                             "msg",
-                        ]:  # Added 'msg'
+                        ]:
                             if (
                                 key in item
                                 and isinstance(item[key], str)

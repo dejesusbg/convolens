@@ -22,9 +22,7 @@ class Conversation(db.Model):
     upload_timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     status = db.Column(db.String(50), default="UPLOADED")
     celery_task_id = db.Column(db.String(128), nullable=True, index=True)
-    language = db.Column(
-        db.String(10), default="en", nullable=False
-    )  # Added language field
+    language = db.Column(db.String(10), default="en", nullable=False)
 
     analysis_result = db.relationship(
         "AnalysisResult",
