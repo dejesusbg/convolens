@@ -1,0 +1,42 @@
+# Git
+.git
+.gitignore
+
+# Python virtual environment
+venv/
+env/
+.venv/
+*.pyenv
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE / Editor specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Docker specific (if any build artifacts are local)
+# docker-compose.override.yml (if used for local dev overrides not to be in image)
+
+# Test files / reports (optional, depends on strategy)
+# htmlcov/
+# .pytest_cache/
+# .tox/
+
+# Secrets / Local Configs (should be handled by env vars or docker secrets)
+.env
+*.env
+secrets/
+*.pem
+*.key
+
+# Uploads directory (if it shouldn't be part of the image, but mounted as volume)
+# uploads/ # For now, let's keep it out of the image. It will be a volume.

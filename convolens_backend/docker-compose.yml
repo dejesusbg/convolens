@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:13-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    ports: # Expose port for local inspection if needed, not for inter-container comms
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=\${POSTGRES_USER:-convolens_user}
+      - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD:-convolens_pass}
+      - POSTGRES_DB=\${POSTGRES_DB:-convolens_db}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER:-convolens_user} -d \${POSTGRES_DB:-convolens_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:6-alpine
+    ports: # Expose port for local inspection if needed
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build: .
+    command: gunicorn -w 4 -b 0.0.0.0:5000 "app.app:create_app()"
+    volumes:
+      - .:/app # Mount current directory to /app in container for live reloading (dev)
+      - uploads_data:/app/uploads # Persistent storage for uploads
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=\${FLASK_ENV:-development}
+      - FLASK_DEBUG=\${FLASK_DEBUG:-1}
+      - DATABASE_URL=postgresql://\${POSTGRES_USER:-convolens_user}:\${POSTGRES_PASSWORD:-convolens_pass}@db:5432/\${POSTGRES_DB:-convolens_db}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      # Add any other necessary environment variables
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # user: "${UID_GID}" # For fixing permissions on mounted volumes in Linux if needed
+
+  worker:
+    build: .
+    command: celery -A app.celery_app.celery worker -l info -Q celery --concurrency=2
+    volumes:
+      - .:/app # Mount current directory for code changes
+      - uploads_data:/app/uploads # Access to uploaded files
+    environment:
+      - DATABASE_URL=postgresql://\${POSTGRES_USER:-convolens_user}:\${POSTGRES_PASSWORD:-convolens_pass}@db:5432/\${POSTGRES_DB:-convolens_db}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      # Add any other necessary environment variables
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # web: # Optional: if worker needs web to be up first for some reason (not typical)
+      #   condition: service_started
+    # user: "${UID_GID}"
+
+volumes:
+  postgres_data:
+  uploads_data: # Define the uploads volume
+
+# Note: For UID_GID to work for volume permissions on Linux:
+# In your .env file or shell, you might need:
+# UID_GID=$(id -u):$(id -g)
+# This is often for ensuring generated files (like logs or DB files if mounted directly) have correct host permissions.
+# For named volumes like postgres_data, Docker manages permissions.
+# For bind mounts (.:/app), the container user's UID/GID matters. Python images often run as root by default.
+# For development, running as root in container is often fine. For prod, consider non-root user.

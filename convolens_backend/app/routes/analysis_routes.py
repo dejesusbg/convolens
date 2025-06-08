@@ -1,153 +1,208 @@
-from flask import Blueprint, request, jsonify, current_app, url_for
+from flask import Blueprint, request, jsonify, current_app, url_for, abort # Added abort
 import os
 from ..tasks import run_full_analysis
 from celery.result import AsyncResult
-from ..models import db, Conversation, AnalysisResult, ConversationStatus # Import db and models
+from ..models import db, Conversation, AnalysisResult, ConversationStatus
+from sqlalchemy import or_
 
 analysis_bp = Blueprint('analysis_bp', __name__)
 
-@analysis_bp.route('/api/files', methods=['GET'])
-def list_uploaded_files():
-    # Optionally, list from DB conversations table instead of filesystem
+@analysis_bp.route('/api/conversations', methods=['GET'])
+def list_conversations():
     try:
-        conversations = Conversation.query.with_entities(Conversation.file_id, Conversation.original_filename, Conversation.status, Conversation.upload_timestamp).all()
-        file_list = [{
-            "file_id": c.file_id,
-            "original_filename": c.original_filename,
-            "status": c.status.value if c.status else None,
-            "uploaded_at": c.upload_timestamp.isoformat() if c.upload_timestamp else None
-        } for c in conversations]
-        return jsonify(files=file_list), 200
-    except Exception as e:
-        current_app.logger.error(f"Error listing files from DB: {e}")
-        return jsonify(error="Could not retrieve file list from database."), 500
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 10, type=int)
+        if page <= 0 or per_page <= 0:
+            abort(400, description="Page and per_page must be positive integers.")
+        if per_page > 100: # Max limit for per_page
+             per_page = 100
+    except ValueError: # Handle cases where type=int fails for non-integer strings
+        abort(400, description="Page and per_page must be integers.")
 
+
+    status_filter = request.args.get('status', type=str)
+    lang_filter = request.args.get('language', type=str)
+
+    query = Conversation.query.order_by(Conversation.upload_timestamp.desc())
+
+    if status_filter:
+        try:
+            status_enum = ConversationStatus[status_filter.upper()]
+            query = query.filter(Conversation.status == status_enum)
+        except KeyError:
+            valid_statuses = [s.name for s in ConversationStatus]
+            abort(400, description=f"Invalid status filter. Valid statuses: {', '.join(valid_statuses)}")
+
+    if lang_filter:
+        # Assuming SUPPORTED_LANGUAGES is accessible or re-defined here, or passed from app config
+        # For simplicity, let's assume it's ok to filter by any string for now,
+        # or rely on the upload validation to ensure only valid langs are in DB.
+        query = query.filter(Conversation.language == lang_filter.lower())
+
+    try:
+        paginated_conversations = query.paginate(page, per_page, error_out=False) # error_out=False prevents 404 on empty page
+    except Exception as e: # Catch potential pagination errors not covered by aborts
+        current_app.logger.error(f"Pagination query error: {e}")
+        abort(500, description="Error during data retrieval.")
+
+
+    conv_list = [{
+        "id": c.id, "file_id": c.file_id, "original_filename": c.original_filename,
+        "status": c.status.value if c.status else None, "language": c.language,
+        "upload_timestamp": c.upload_timestamp.isoformat() if c.upload_timestamp else None,
+        "celery_task_id": c.celery_task_id,
+        "details_url": url_for('analysis_bp.get_conversation_details', conversation_identifier=c.id, _external=True),
+        "analysis_result_url": url_for('analysis_bp.get_task_result', task_id=c.celery_task_id, _external=True) if c.celery_task_id else None
+    } for c in paginated_conversations.items]
+
+    return jsonify({
+        "conversations": conv_list,
+        "total_pages": paginated_conversations.pages,
+        "current_page": page, "per_page": per_page, "total_items": paginated_conversations.total
+    }), 200
+
+@analysis_bp.route('/api/conversations/<conversation_identifier>', methods=['GET'])
+def get_conversation_details(conversation_identifier):
+    query = Conversation.query
+    if conversation_identifier.isdigit():
+        query = query.filter(Conversation.id == int(conversation_identifier))
+    else:
+        query = query.filter(Conversation.file_id == conversation_identifier)
+
+    conversation = query.first()
+    if not conversation:
+        abort(404, description="Conversation not found.")
+
+    # Ensure c.upload_timestamp is used in isoformat(), not the loop variable from list_conversations
+    upload_ts_iso = conversation.upload_timestamp.isoformat() if conversation.upload_timestamp else None
+
+    return jsonify({
+        "id": conversation.id, "file_id": conversation.file_id, "original_filename": conversation.original_filename,
+        "status": conversation.status.value if conversation.status else None, "language": conversation.language,
+        "upload_timestamp": upload_ts_iso,
+        "celery_task_id": conversation.celery_task_id,
+        "analysis_result_summary_url": url_for('analysis_bp.get_task_result', task_id=conversation.celery_task_id, _external=True) if conversation.celery_task_id else None,
+        "emotion_results_url": url_for('analysis_bp.get_specific_analysis_result', conversation_identifier=conversation.id, analysis_type='emotion_analysis', _external=True) if conversation.status in [ConversationStatus.COMPLETED, ConversationStatus.COMPLETED_WITH_ERRORS] else None,
+        "persuasion_results_url": url_for('analysis_bp.get_specific_analysis_result', conversation_identifier=conversation.id, analysis_type='persuasion_analysis', _external=True) if conversation.status in [ConversationStatus.COMPLETED, ConversationStatus.COMPLETED_WITH_ERRORS] else None,
+    }), 200
+
+
+@analysis_bp.route('/api/conversations/<conversation_identifier>/results/<analysis_type>', methods=['GET'])
+def get_specific_analysis_result(conversation_identifier, analysis_type):
+    query = Conversation.query
+    if conversation_identifier.isdigit():
+        query = query.filter(Conversation.id == int(conversation_identifier))
+    else:
+        query = query.filter(Conversation.file_id == conversation_identifier)
+
+    conversation = query.first()
+    if not conversation: abort(404, description="Conversation not found.")
+
+    if conversation.status not in [ConversationStatus.COMPLETED, ConversationStatus.COMPLETED_WITH_ERRORS]:
+        abort(409, description=f"Analysis not yet complete or failed. Current status: {conversation.status.value}")
+
+    analysis_result_record = AnalysisResult.query.filter_by(conversation_id=conversation.id).first()
+    if not analysis_result_record or not analysis_result_record.data:
+        abort(404, description="Analysis result data not found for this conversation.")
+
+    full_results_payload = analysis_result_record.data.get("results", {})
+
+    # Normalize analysis_type for matching (e.g. emotion vs emotion_analysis)
+    # This simple check is basic, more robust mapping might be needed if keys vary a lot.
+    normalized_analysis_type = analysis_type.lower().replace('-', '_')
+    actual_key_found = None
+    for key in full_results_payload.keys():
+        if normalized_analysis_type == key.lower().replace('-', '_'):
+            actual_key_found = key
+            break
+
+    if not actual_key_found:
+        valid_types = list(full_results_payload.keys())
+        abort(404, description=f"Invalid analysis type '{analysis_type}'. Valid types: {valid_types}")
+
+    specific_result = full_results_payload.get(actual_key_found) # Use the found actual key
+
+    return jsonify({
+        "conversation_id": conversation.id, "file_id": conversation.file_id,
+        "analysis_type_requested": analysis_type, "analysis_type_found": actual_key_found,
+        "data": specific_result
+    }), 200
+
+
+# --- Task Management Endpoints (largely same, rely on app error handlers) ---
 @analysis_bp.route('/api/analyze/<file_id>', methods=['POST'])
 def start_analysis_task(file_id):
-    if '..' in file_id or '/' in file_id: # Basic security check
-        return jsonify(error="Invalid file_id format."), 400
+    if '..' in file_id or '/' in file_id: abort(400, description="Invalid file_id format.")
 
     conversation = Conversation.query.filter_by(file_id=file_id).first()
-    if not conversation:
-         return jsonify(error=f"Conversation with file_id: {file_id} not found. Please upload the file first."), 404
+    if not conversation: abort(404, description=f"Conversation with file_id: {file_id} not found.")
 
-    # Prevent re-analysis if already completed or processing, unless forced (add force param later)
-    if conversation.status in [ConversationStatus.PROCESSING, ConversationStatus.PENDING_ANALYSIS, ConversationStatus.COMPLETED, ConversationStatus.COMPLETED_WITH_ERRORS]:
-        return jsonify(message="Analysis for this file is already processing or completed.",
-                       task_id=conversation.celery_task_id,
-                       status=conversation.status.value,
-                       status_url=url_for('analysis_bp.get_task_status', task_id=conversation.celery_task_id, _external=True) if conversation.celery_task_id else None,
-                       result_url=url_for('analysis_bp.get_task_result', task_id=conversation.celery_task_id, _external=True) if conversation.celery_task_id else None
-                       ), 409 # Conflict / Already done
+    force_analysis = request.args.get('force', 'false').lower() == 'true'
+    if conversation.status in [ConversationStatus.PROCESSING, ConversationStatus.PENDING_ANALYSIS, ConversationStatus.COMPLETED, ConversationStatus.COMPLETED_WITH_ERRORS] and not force_analysis:
+        abort(409, description="Analysis for this file is already processing or completed. Use ?force=true to re-analyze.")
 
-    # Dispatch Celery task
     task = run_full_analysis.delay(file_id)
-
-    # Update conversation record with task_id and PENDING_ANALYSIS status
     conversation.celery_task_id = task.id
     conversation.status = ConversationStatus.PENDING_ANALYSIS
     try:
         db.session.commit()
     except Exception as e:
         db.session.rollback()
-        current_app.logger.error(f"DB error updating conversation for task start: {e}")
-        # Task is dispatched, but DB state might be inconsistent. Client will see old status until worker updates it.
-        # This is a potential inconsistency point.
+        current_app.logger.error(f"DB error in start_analysis_task: {e}", exc_info=True)
+        abort(500, description="Failed to update conversation status for analysis task.")
 
     return jsonify({
-        "message": "Analysis task started.",
-        "task_id": task.id,
-        "file_id": file_id,
+        "message": "Analysis task started.", "task_id": task.id, "file_id": file_id,
         "conversation_id": conversation.id,
         "status_url": url_for('analysis_bp.get_task_status', task_id=task.id, _external=True),
         "result_url": url_for('analysis_bp.get_task_result', task_id=task.id, _external=True)
-    }), 202 # Accepted
+    }), 202
 
 @analysis_bp.route('/api/analysis_status/<task_id>', methods=['GET'])
 def get_task_status(task_id):
-    # First, check DB for persisted status
+    # (Logic largely same, error handling for not found conversation is now handled by abort(404) or similar)
     conversation = Conversation.query.filter_by(celery_task_id=task_id).first()
-    db_status = None
-    if conversation:
-        db_status = conversation.status.value if conversation.status else "UNKNOWN_IN_DB"
+    db_status = conversation.status.value if conversation else "TASK_ID_NOT_IN_DB"
 
-    # Then, check Celery for real-time task state
+    # Check Celery task state
     celery_task = AsyncResult(task_id, app=current_app.extensions['celery'])
     celery_state = celery_task.state
 
-    response = {
-        "task_id": task_id,
-        "celery_state": celery_state,
-        "db_conversation_status": db_status,
-        "current_status_source": "celery" # Default to celery as more real-time
-    }
+    response = {"task_id": task_id, "celery_state": celery_state, "db_conversation_status": db_status}
 
-    if celery_state == 'PENDING':
-        response['status_message'] = 'Task is waiting to be processed by a worker.'
-    elif celery_state == 'STARTED' or celery_state == 'PROGRESS': # Celery 'STARTED' or our custom 'PROGRESS'
-        response['status_message'] = 'Task is currently running.'
-        if celery_task.info and isinstance(celery_task.info, dict): # Our custom progress from task.update_state()
-            response['progress'] = celery_task.info
-    elif celery_state == 'SUCCESS':
-        response['status_message'] = 'Celery task completed successfully. Result should be in DB.'
-        response['current_status_source'] = "database" # If Celery says success, DB should reflect final state
+    if conversation and conversation.status in [ConversationStatus.COMPLETED, ConversationStatus.COMPLETED_WITH_ERRORS, ConversationStatus.FAILED]:
+        response['authoritative_status'] = db_status
+        response['status_message'] = f"Final status from DB: {db_status}"
+    elif celery_state == 'PENDING': response['status_message'] = 'Task is waiting.'
+    elif celery_state in ['STARTED', 'PROGRESS']:
+        response['status_message'] = 'Task running.'
+        if celery_task.info and isinstance(celery_task.info, dict): response['progress'] = celery_task.info
+    elif celery_state == 'SUCCESS': response['status_message'] = 'Celery task success. DB should reflect final state.'
     elif celery_state == 'FAILURE':
         response['status_message'] = 'Celery task failed.'
-        response['error_info_celery'] = str(celery_task.info) # Celery's exception info
-        response['current_status_source'] = "database" # DB should reflect FAILED or COMPLETED_WITH_ERRORS
-    else: # Other states like RETRY, REVOKED
-        response['status_message'] = f'Task is in state: {celery_state}.'
-
-    # If Celery state is terminal (SUCCESS/FAILURE), but DB status doesn't match, flag it.
-    if celery_state in ['SUCCESS', 'FAILURE'] and conversation and        ((celery_state == 'SUCCESS' and conversation.status not in [ConversationStatus.COMPLETED, ConversationStatus.COMPLETED_WITH_ERRORS]) or         (celery_state == 'FAILURE' and conversation.status != ConversationStatus.FAILED)):
-        response['consistency_warning'] = "Potential inconsistency between Celery state and DB status. DB status is authoritative for final results."
-        # response['current_status_source'] = "database" # Already set for SUCCESS/FAILURE
-
-
-    # If conversation status from DB is terminal, it's more reliable than Celery if Celery result expired
-    if conversation and conversation.status in [ConversationStatus.COMPLETED, ConversationStatus.COMPLETED_WITH_ERRORS, ConversationStatus.FAILED]:
-         response['status_message'] = f"Final status from DB: {conversation.status.value}"
-         response['current_status_source'] = "database"
+        response['error_info_celery'] = str(celery_task.info)
+    else: response['status_message'] = f'Task state: {celery_state}.'
 
     return jsonify(response), 200
+
 
 @analysis_bp.route('/api/analysis_result/<task_id>', methods=['GET'])
 def get_task_result(task_id):
     conversation = Conversation.query.filter_by(celery_task_id=task_id).first()
-
-    if not conversation:
-        # Try to get info from Celery directly if no DB record, Celery result might still exist
-        celery_task_direct = AsyncResult(task_id, app=current_app.extensions['celery'])
-        if celery_task_direct.state == 'PENDING' or celery_task_direct.state == 'PROGRESS':
-             return jsonify(message="Analysis is still processing (no DB record yet).", task_id=task_id, celery_state=celery_task_direct.state), 202
-        elif celery_task_direct.state == 'SUCCESS': # Should ideally be in DB, but as fallback
-             return jsonify(message="Result found in Celery (DB record missing).", task_id=task_id, celery_state=celery_task_direct.state, result_from_celery=celery_task_direct.result), 200
-        return jsonify(error=f"No conversation found for task_id: {task_id}. Celery result might have expired or task ID is invalid."), 404
+    if not conversation: abort(404, description=f"No conversation found for task_id: {task_id}.")
 
     if conversation.status not in [ConversationStatus.COMPLETED, ConversationStatus.COMPLETED_WITH_ERRORS, ConversationStatus.FAILED]:
-        # Task not finished yet, or failed before results could be processed
-        celery_task = AsyncResult(task_id, app=current_app.extensions['celery']) # Check celery state
-        return jsonify(message="Analysis is not yet complete or results are not available.",
-                       task_id=task_id,
-                       db_status=conversation.status.value if conversation.status else "N/A",
-                       celery_state=celery_task.state), 202 # Accepted, but not ready
+        celery_task = AsyncResult(task_id, app=current_app.extensions['celery'])
+        return jsonify(message="Analysis not yet complete or results unavailable.",
+                       task_id=task_id, db_status=conversation.status.value, celery_state=celery_task.state), 202
 
     analysis_result_record = AnalysisResult.query.filter_by(conversation_id=conversation.id).first()
+    if not analysis_result_record: abort(404, description="Analysis result record not found.")
 
-    if not analysis_result_record:
-        # This might happen if task failed before creating the result record, or DB issue
-        return jsonify(error="Analysis result record not found in database, though conversation status is terminal.",
-                       task_id=task_id,
-                       conversation_status=conversation.status.value), 404
-
-    # The 'data' field in AnalysisResult contains the full output from the Celery task.
-    # This includes 'task_status_reported', 'results', and 'errors' keys.
     return jsonify({
-        "task_id": task_id,
-        "file_id": conversation.file_id,
-        "conversation_id": conversation.id,
-        "final_conversation_status_in_db": conversation.status.value,
-        "analysis_output": analysis_result_record.data # This is the dict saved by the task
+        "task_id": task_id, "file_id": conversation.file_id, "conversation_id": conversation.id,
+        "final_db_status": conversation.status.value,
+        "analysis_output": analysis_result_record.data
     }), 200
 
 EOL

@@ -1,10 +1,15 @@
 from flask import Flask, request, jsonify
 import os
 import uuid
+import logging # For more detailed logging configuration
+
 from .celery_app import init_celery
-from .models import db, Conversation, ConversationStatus # Import db and models
+from .models import db, Conversation, ConversationStatus
+from flask_cors import CORS # Import CORS
+from flask_talisman import Talisman # Import Talisman
 
 ALLOWED_EXTENSIONS = {'txt', 'json', 'csv'}
+SUPPORTED_LANGUAGES = ['en', 'es']
 
 def allowed_file(filename):
     return '.' in filename and            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -12,75 +17,124 @@ def allowed_file(filename):
 def create_app(config_name=None):
     app = Flask(__name__)
 
-    # Configuration
+    # --- Configuration ---
     app.config['UPLOAD_FOLDER'] = os.path.join(os.getcwd(), 'uploads')
     app.config['CELERY_BROKER_URL'] = os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0')
     app.config['CELERY_RESULT_BACKEND'] = os.environ.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
-
-    # SQLAlchemy Configuration
     app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'postgresql://user:password@localhost:5432/convolens_db')
-    # Replace 'user:password@localhost:5432/convolens_db' with your actual DB connection string or ensure DATABASE_URL env var is set.
-    # For the subtask, this default string will be present but might not connect if DB not set up.
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+    # CORS Configuration - Allow all origins for development.
+    # For production, specify allowed origins: CORS(app, origins=["https://yourfrontend.com"])
+    CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+    # Talisman Configuration for security headers
+    # Basic CSP: only allow resources from 'self'. API might not need complex CSP.
+    # For a pure API, a very restrictive CSP like "default-src 'none'" might be too much if health checks or other things are served.
+    # Let's start with some common non-CSP headers.
+    talisman_options = {
+        'content_security_policy': None, # Disable complex CSP for now, can be added later
+        'force_https': os.environ.get('FLASK_ENV') == 'production', # Force HTTPS if in production (behind a proxy usually)
+        'strict_transport_security': os.environ.get('FLASK_ENV') == 'production',
+        'session_cookie_secure': os.environ.get('FLASK_ENV') == 'production',
+        'session_cookie_httponly': True,
+        'frame_options': 'DENY', # Or 'SAMEORIGIN'
+        'content_type_nosniff': True,
+    }
+    Talisman(app, **talisman_options)
+
 
     if not os.path.exists(app.config['UPLOAD_FOLDER']):
         os.makedirs(app.config['UPLOAD_FOLDER'])
 
-    # Initialize extensions
-    db.init_app(app)
-    init_celery(app) # Celery init might need app context for db access if tasks use db directly
+    # --- Logging Configuration ---
+    if not app.debug: # More verbose logging in production
+        app.logger.setLevel(logging.INFO)
+        # Example: Add a file handler
+        # file_handler = logging.FileHandler('production.log')
+        # file_handler.setLevel(logging.INFO)
+        # app.logger.addHandler(file_handler)
+    else:
+        app.logger.setLevel(logging.DEBUG)
 
-    # Create DB tables if they don't exist (for development, use migrations for prod)
+    app.logger.info("Convolens application starting up...")
+
+
+    # --- Initialize Extensions ---
+    db.init_app(app)
+    init_celery(app)
+
     with app.app_context():
-        # db.drop_all() # Use with caution: drops all tables
         db.create_all()
 
+    # --- Error Handling ---
+    @app.errorhandler(400)
+    def bad_request_error(error):
+        return jsonify(error="Bad Request", message=str(error.description if hasattr(error, 'description') else error)), 400
+
+    @app.errorhandler(404)
+    def not_found_error(error):
+        return jsonify(error="Not Found", message=str(error.description if hasattr(error, 'description') else "Resource not found.")), 404
+
+    @app.errorhandler(500)
+    def internal_error(error):
+        db.session.rollback() # Rollback DB session in case of internal error
+        app.logger.error(f"Internal Server Error: {error}", exc_info=True)
+        return jsonify(error="Internal Server Error", message="An unexpected error occurred. Please try again later."), 500
+
+    # --- Routes ---
     @app.route('/health')
     def health():
-        # Add DB health check
         try:
             db.session.execute("SELECT 1")
             db_status = "OK"
         except Exception as e:
-            db_status = f"Error: {e}"
-        return jsonify(status="OK", database=db_status)
+            db_status = f"Error: {str(e)}"
+        return jsonify(status="OK", database=db_status, redis_ping="PONG") # Basic Redis check can be added if needed by pinging celery broker
 
     @app.route('/api/upload', methods=['POST'])
     def upload_file():
+        # (Upload logic remains similar, but benefits from global error handlers)
         if 'file' not in request.files:
-            return jsonify(error="No file part in the request"), 400
+            return jsonify(error="No file part in the request", details="File is required."), 400
 
         file = request.files['file']
-        original_fname = file.filename # Store original filename
+        original_fname = file.filename
+
+        lang_code = request.form.get('language', 'en').lower()
+        if lang_code not in SUPPORTED_LANGUAGES:
+            return jsonify(error="Unsupported language", details=f"Supported codes: {', '.join(SUPPORTED_LANGUAGES)}"), 400
 
         if original_fname == '':
-            return jsonify(error="No selected file"), 400
+            return jsonify(error="No selected file", details="Filename cannot be empty."), 400
 
-        if file and allowed_file(original_fname):
-            file_id = str(uuid.uuid4()) + os.path.splitext(original_fname)[1]
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
+        if not allowed_file(original_fname):
+            return jsonify(error="File type not allowed", details=f"Allowed types: {', '.join(ALLOWED_EXTENSIONS)}"), 400
 
-            try:
-                file.save(filepath)
+        file_id = str(uuid.uuid4()) + os.path.splitext(original_fname)[1]
 
-                # Create Conversation record in DB
-                new_conversation = Conversation(
-                    file_id=file_id,
-                    original_filename=original_fname,
-                    status=ConversationStatus.UPLOADED
-                )
-                db.session.add(new_conversation)
-                db.session.commit()
+        try:
+            upload_dir = app.config['UPLOAD_FOLDER']
+            # Path creation already handled in create_app, but defensive check:
+            if not os.path.exists(upload_dir): os.makedirs(upload_dir)
 
-                return jsonify(message="File uploaded successfully and conversation record created.",
-                               file_id=file_id,
-                               conversation_id=new_conversation.id), 201
-            except Exception as e:
-                db.session.rollback()
-                app.logger.error(f"Error saving file or creating conversation record: {e}")
-                return jsonify(error=f"An error occurred: {str(e)}"), 500
-        else:
-            return jsonify(error="File type not allowed. Allowed types: txt, json, csv"), 400
+            filepath_to_save = os.path.join(upload_dir, file_id)
+            file.save(filepath_to_save)
+
+            new_conversation = Conversation(
+                file_id=file_id, original_filename=original_fname,
+                status=ConversationStatus.UPLOADED, language=lang_code
+            )
+            db.session.add(new_conversation)
+            db.session.commit()
+
+            return jsonify(message="File uploaded successfully.",
+                           file_id=file_id, conversation_id=new_conversation.id, language=lang_code), 201
+        except Exception as e:
+            db.session.rollback()
+            app.logger.error(f"Upload error: {e}", exc_info=True)
+            return jsonify(error="Upload failed", message=str(e)), 500
+
 
     from .routes.analysis_routes import analysis_bp
     app.register_blueprint(analysis_bp)
@@ -88,7 +142,7 @@ def create_app(config_name=None):
     return app
 
 if __name__ == '__main__':
-    app = create_app()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    current_app_instance = create_app() # Renamed to avoid conflict with flask.current_app proxy
+    current_app_instance.run(host='0.0.0.0', port=5000, debug=True) # Use the instance here
 
 EOL
