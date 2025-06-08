@@ -1,11 +1,12 @@
-import pytest
+import pytest  # type: ignore
 from app.app import create_app
-from app.models import db, Conversation, AnalysisResult, ConversationStatus
+from app.models import db, Conversation, AnalysisResult
 import os
 import tempfile
 from io import BytesIO
 
-@pytest.fixture(scope='session')
+
+@pytest.fixture(scope="session")
 def app():
     """Session-wide test Flask app."""
     # Use a temporary SQLite DB for testing to avoid interfering with dev DB
@@ -37,29 +38,29 @@ def app():
 
     # Create a temporary directory for the instance folder and SQLite DB
     temp_dir = tempfile.TemporaryDirectory()
-    instance_path = os.path.join(temp_dir.name, 'instance')
+    instance_path = os.path.join(temp_dir.name, "instance")
     os.makedirs(instance_path, exist_ok=True)
-    test_db_path = os.path.join(instance_path, 'test.sqlite')
+    test_db_path = os.path.join(instance_path, "test.sqlite")
     test_db_url = f"sqlite:///{test_db_path}"
 
-
-    flask_app = create_app() # Create app using your factory
-    flask_app.config.update({
-        "TESTING": True,
-        "SQLALCHEMY_DATABASE_URI": test_db_url,
-        "CELERY_BROKER_URL": "memory://", # Use in-memory broker for Celery for tests (if tasks are tested directly)
-        "CELERY_RESULT_BACKEND": "cache+memory://", # Or use a test Redis if available/mocked
-        "UPLOAD_FOLDER": tempfile.mkdtemp(), # Temporary upload folder
-        "SERVER_NAME": "localhost.test" # For url_for to work without active request context
-    })
+    flask_app = create_app()  # Create app using your factory
+    flask_app.config.update(
+        {
+            "TESTING": True,
+            "SQLALCHEMY_DATABASE_URI": test_db_url,
+            "CELERY_BROKER_URL": "memory://",  # Use in-memory broker for Celery for tests (if tasks are tested directly)
+            "CELERY_RESULT_BACKEND": "cache+memory://",  # Or use a test Redis if available/mocked
+            "UPLOAD_FOLDER": tempfile.mkdtemp(),  # Temporary upload folder
+            "SERVER_NAME": "localhost.test",  # For url_for to work without active request context
+        }
+    )
 
     # print(f"App config during test setup: {flask_app.config}")
 
-
     with flask_app.app_context():
-        db.create_all() # Create tables in the test DB
+        db.create_all()  # Create tables in the test DB
 
-    yield flask_app # Provide the app object to tests
+    yield flask_app  # Provide the app object to tests
 
     # Teardown: clean up the temporary database file and directory
     # os.close(db_fd)
@@ -67,17 +68,20 @@ def app():
     # os.unlink(temp_db_file.name) # Remove the named temporary file
     # if os.path.exists(test_db_path):
     #    os.unlink(test_db_path)
-    temp_dir.cleanup() # Cleans up the directory and its contents
+    temp_dir.cleanup()  # Cleans up the directory and its contents
+
 
 @pytest.fixture()
 def client(app):
     """A test client for the app."""
     return app.test_client()
 
+
 @pytest.fixture()
 def runner(app):
     """A test CLI runner for the app."""
     return app.test_cli_runner()
+
 
 @pytest.fixture(scope="function")
 def clean_db(app):
@@ -89,7 +93,5 @@ def clean_db(app):
         db.session.remove()
         db.drop_all()
         db.create_all()
-    yield # Test runs here
+    yield  # Test runs here
     # Optional: any post-test cleanup specific to this fixture if needed
-
-EOL
