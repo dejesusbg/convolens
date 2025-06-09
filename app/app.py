@@ -4,9 +4,9 @@ import logging
 from flask import Flask, request, jsonify  # type: ignore
 from flask_cors import CORS  # type: ignore
 from flask_talisman import Talisman  # type: ignore
-from sqlalchemy import text  # type: ignore
+import redis  # type: ignore
+from datetime import datetime  # type: ignore
 from .celery_app import init_celery
-from .models import db, migrate, Conversation
 
 ALLOWED_EXTENSIONS = {"txt", "json", "csv"}
 SUPPORTED_LANGUAGES = ["en", "es"]
@@ -27,10 +27,9 @@ def create_app(config_name=None):
     app.config["CELERY_RESULT_BACKEND"] = os.environ.get(
         "CELERY_RESULT_BACKEND", "redis://localhost:6379/0"
     )
-    app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
-        "DATABASE_URL", "postgresql://user:password@localhost:5432/convolens_db"
+    app.config["REDIS_CACHE_TTL_SECONDS"] = int(
+        os.environ.get("REDIS_CACHE_TTL_SECONDS", "600")
     )
-    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
     app.config["SESSION_COOKIE_HTTPONLY"] = True
 
     # CORS Configuration - Allow all origins for development.
@@ -67,9 +66,11 @@ def create_app(config_name=None):
     app.logger.info("Convolens application starting up...")
 
     # --- Initialize Extensions ---
-    db.init_app(app)
-    migrate.init_app(app, db)
     init_celery(app)
+    app.redis_client = redis.Redis.from_url(
+        app.config["CELERY_BROKER_URL"],
+        decode_responses=True,  # Important for reading strings back easily
+    )
 
     # --- Error Handling ---
     @app.errorhandler(400)
@@ -100,7 +101,6 @@ def create_app(config_name=None):
 
     @app.errorhandler(500)
     def internal_error(error):
-        db.session.rollback()  # Rollback DB session in case of internal error
         app.logger.error(f"Internal Server Error: {error}", exc_info=True)
         return (
             jsonify(
@@ -114,12 +114,11 @@ def create_app(config_name=None):
     @app.route("/api/health")
     def health():
         try:
-            db.session.execute(text("SELECT 1"))
-            db_status = "OK"
+            app.redis_client.ping()
+            redis_status = "OK"
         except Exception as e:
-            db_status = f"Error: {str(e)}"
-        # Basic Redis check can be added if needed by pinging celery broker
-        return jsonify(status="OK", database=db_status, redis_ping="PONG")
+            redis_status = f"Error: {str(e)}"
+        return jsonify(status="OK", redis_connection=redis_status)
 
     @app.route("/api/upload", methods=["POST"])
     def upload_file():
@@ -171,26 +170,27 @@ def create_app(config_name=None):
             filepath_to_save = os.path.join(upload_dir, file_id)
             file.save(filepath_to_save)
 
-            new_conversation = Conversation(
-                file_id=file_id,
-                original_filename=original_fname,
-                status="UPLOADED",
-                language=lang_code,
-            )
-            db.session.add(new_conversation)
-            db.session.commit()
+            upload_ts = datetime.utcnow().isoformat()
+            metadata = {
+                "original_filename": original_fname,
+                "upload_timestamp": upload_ts,
+                "status": "UPLOADED",
+                "language": lang_code,
+                "file_id": file_id,  # Also store file_id in the hash for convenience
+            }
+            redis_key = f"filemeta:{file_id}"
+            app.redis_client.hmset(redis_key, metadata)
+            app.redis_client.expire(redis_key, app.config["REDIS_CACHE_TTL_SECONDS"])
 
             return (
                 jsonify(
                     message="File uploaded successfully.",
                     file_id=file_id,
-                    conversation_id=new_conversation.id,
                     language=lang_code,
                 ),
                 201,
             )
         except Exception as e:
-            db.session.rollback()
             app.logger.error(f"Upload error: {e}", exc_info=True)
             return jsonify(error="Upload failed", message=str(e)), 500
 

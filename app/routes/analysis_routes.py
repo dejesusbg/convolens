@@ -1,165 +1,112 @@
 from flask import Blueprint, request, jsonify, current_app, url_for, abort  # type: ignore
 from celery.result import AsyncResult  # type: ignore
-from sqlalchemy import or_  # type: ignore
+import redis # type: ignore
+import json # type: ignore
 from ..tasks import run_full_analysis
-from ..models import db, Conversation, AnalysisResult
 
 analysis_bp = Blueprint("analysis_bp", __name__)
 
 
 @analysis_bp.route("/api/conversations", methods=["GET"])
 def list_conversations():
-    try:
-        page = request.args.get("page", 1, type=int)
-        per_page = request.args.get("per_page", 10, type=int)
-        if page <= 0 or per_page <= 0:
-            abort(400, description="Page and per_page must be positive integers.")
-        if per_page > 100:
-            per_page = 100
-    except ValueError:
-        abort(400, description="Page and per_page must be integers.")
-
+    redis_client = current_app.redis_client
     status_filter = request.args.get("status", type=str)
     lang_filter = request.args.get("language", type=str)
 
-    query = Conversation.query.order_by(Conversation.upload_timestamp.desc())
+    conv_list = []
+    file_meta_keys = redis_client.scan_iter("filemeta:*")
 
-    if status_filter:
-        valid_statuses = [
-            "UPLOADED",
-            "PENDING_ANALYSIS",
-            "PROCESSING",
-            "COMPLETED",
-            "COMPLETED_WITH_ERRORS",
-            "FAILED",
-        ]
-        if status_filter not in valid_statuses:
-            abort(
-                400,
-                description=f"Invalid status filter. Valid statuses: {', '.join(valid_statuses)}",
-            )
-        query = query.filter(Conversation.status == status_filter)
+    for key in file_meta_keys:
+        c_data = redis_client.hgetall(key)
 
-    if lang_filter:
-        # Assuming SUPPORTED_LANGUAGES is accessible or re-defined here, or passed from app config
-        # For simplicity, let's assume it's ok to filter by any string for now,
-        # or rely on the upload validation to ensure only valid langs are in DB.
-        query = query.filter(Conversation.language == lang_filter.lower())
+        if status_filter and c_data.get("status") != status_filter:
+            continue
+        if lang_filter and c_data.get("language") != lang_filter.lower():
+            continue
 
-    try:
-        paginated_conversations = query.paginate(
-            page=page, per_page=per_page, error_out=False
-        )
-    except Exception as e:  # Catch potential pagination errors not covered by aborts
-        current_app.logger.error(f"Pagination query error: {e}")
-        abort(500, description="Error during data retrieval.")
+        file_id = c_data.get("file_id", key.split(":", 1)[1]) # Extract file_id from key if not in hash
 
-    conv_list = [
-        {
-            "id": c.id,
-            "file_id": c.file_id,
-            "original_filename": c.original_filename,
-            "status": c.status if c.status else None,
-            "language": c.language,
-            "upload_timestamp": (
-                c.upload_timestamp.isoformat() if c.upload_timestamp else None
-            ),
-            "celery_task_id": c.celery_task_id,
+        conv_list.append({
+            "id": file_id, # Using file_id as the primary identifier
+            "file_id": file_id,
+            "original_filename": c_data.get("original_filename"),
+            "status": c_data.get("status"),
+            "language": c_data.get("language"),
+            "upload_timestamp": c_data.get("upload_timestamp"),
+            "celery_task_id": c_data.get("celery_task_id"),
             "details_url": url_for(
                 "analysis_bp.get_conversation_details",
-                conversation_identifier=c.id,
+                conversation_identifier=file_id, # Use file_id
                 _external=True,
             ),
             "analysis_result_url": (
                 url_for(
-                    "analysis_bp.get_task_result",
-                    task_id=c.celery_task_id,
+                    "analysis_bp.get_task_result", # This will need adjustment if route changes
+                    task_id=c_data.get("celery_task_id"),
                     _external=True,
                 )
-                if c.celery_task_id
+                if c_data.get("celery_task_id")
                 else None
             ),
-        }
-        for c in paginated_conversations.items
-    ]
+        })
 
-    return (
-        jsonify(
-            {
-                "conversations": conv_list,
-                "total_pages": paginated_conversations.pages,
-                "current_page": page,
-                "per_page": per_page,
-                "total_items": paginated_conversations.total,
-            }
-        ),
-        200,
-    )
+    # Optional: Sort by upload_timestamp if needed, requires parsing the string to datetime
+    # conv_list.sort(key=lambda x: x.get("upload_timestamp") or "", reverse=True)
+
+
+    return jsonify({"conversations": conv_list, "total_items": len(conv_list)}), 200
 
 
 @analysis_bp.route("/api/conversations/<conversation_identifier>", methods=["GET"])
 def get_conversation_details(conversation_identifier):
-    query = Conversation.query
-    if conversation_identifier.isdigit():
-        query = query.filter(Conversation.id == int(conversation_identifier))
-    else:
-        query = query.filter(Conversation.file_id == conversation_identifier)
+    file_id = conversation_identifier # Assuming identifier is file_id
+    redis_client = current_app.redis_client
+    meta_key = f"filemeta:{file_id}"
 
-    conversation = query.first()
-    if not conversation:
-        abort(404, description="Conversation not found.")
+    metadata = redis_client.hgetall(meta_key)
+    if not metadata:
+        abort(404, description="Conversation metadata not found in Redis.")
 
-    upload_ts_iso = (
-        conversation.upload_timestamp.isoformat()
-        if conversation.upload_timestamp
-        else None
-    )
+    status = metadata.get("status")
+    celery_task_id = metadata.get("celery_task_id")
 
     return (
         jsonify(
             {
-                "id": conversation.id,
-                "file_id": conversation.file_id,
-                "original_filename": conversation.original_filename,
-                "status": conversation.status.value if conversation.status else None,
-                "language": conversation.language,
-                "upload_timestamp": upload_ts_iso,
-                "celery_task_id": conversation.celery_task_id,
+                "id": file_id, # Using file_id as the primary identifier
+                "file_id": file_id,
+                "original_filename": metadata.get("original_filename"),
+                "status": status,
+                "language": metadata.get("language"),
+                "upload_timestamp": metadata.get("upload_timestamp"),
+                "celery_task_id": celery_task_id,
                 "analysis_result_summary_url": (
                     url_for(
-                        "analysis_bp.get_task_result",
-                        task_id=conversation.celery_task_id,
+                        "analysis_bp.get_task_result", # This will be updated if route changes
+                        task_id=celery_task_id,
                         _external=True,
                     )
-                    if conversation.celery_task_id
+                    if celery_task_id
                     else None
                 ),
                 "emotion_results_url": (
                     url_for(
                         "analysis_bp.get_specific_analysis_result",
-                        conversation_identifier=conversation.id,
+                        conversation_identifier=file_id, # Use file_id
                         analysis_type="emotion_analysis",
                         _external=True,
                     )
-                    if conversation.status
-                    in [
-                        "COMPLETED",
-                        "COMPLETED_WITH_ERRORS",
-                    ]
+                    if status in ["COMPLETED", "COMPLETED_WITH_ERRORS"]
                     else None
                 ),
                 "persuasion_results_url": (
                     url_for(
                         "analysis_bp.get_specific_analysis_result",
-                        conversation_identifier=conversation.id,
+                        conversation_identifier=file_id, # Use file_id
                         analysis_type="persuasion_analysis",
                         _external=True,
                     )
-                    if conversation.status
-                    in [
-                        "COMPLETED",
-                        "COMPLETED_WITH_ERRORS",
-                    ]
+                    if status in ["COMPLETED", "COMPLETED_WITH_ERRORS"]
                     else None
                 ),
             }
@@ -173,32 +120,28 @@ def get_conversation_details(conversation_identifier):
     methods=["GET"],
 )
 def get_specific_analysis_result(conversation_identifier, analysis_type):
-    query = Conversation.query
-    if conversation_identifier.isdigit():
-        query = query.filter(Conversation.id == int(conversation_identifier))
-    else:
-        query = query.filter(Conversation.file_id == conversation_identifier)
+    file_id = conversation_identifier # Assuming identifier is file_id
+    redis_client = current_app.redis_client
+    meta_key = f"filemeta:{file_id}"
+    result_key = f"analysisresult:{file_id}"
 
-    conversation = query.first()
-    if not conversation:
-        abort(404, description="Conversation not found.")
+    file_meta = redis_client.hgetall(meta_key)
+    if not file_meta:
+        abort(404, description="Conversation metadata not found in Redis.")
 
-    if conversation.status not in [
-        "COMPLETED",
-        "COMPLETED_WITH_ERRORS",
-    ]:
+    status = file_meta.get("status")
+    if status not in ["COMPLETED", "COMPLETED_WITH_ERRORS"]:
         abort(
             409,
-            description=f"Analysis not yet complete or failed. Current status: {conversation.status.value}",
+            description=f"Analysis not yet complete or failed. Current status: {status}",
         )
 
-    analysis_result_record = AnalysisResult.query.filter_by(
-        conversation_id=conversation.id
-    ).first()
-    if not analysis_result_record or not analysis_result_record.data:
-        abort(404, description="Analysis result data not found for this conversation.")
+    result_json_str = redis_client.get(result_key)
+    if not result_json_str:
+        abort(404, description="Analysis result data not found in Redis.")
 
-    full_results_payload = analysis_result_record.data.get("results", {})
+    analysis_result_record_data = json.loads(result_json_str)
+    full_results_payload = analysis_result_record_data.get("results", {})
 
     # Normalize analysis_type for matching (e.g. emotion vs emotion_analysis)
     # This simple check is basic, more robust mapping might be needed if keys vary a lot.
@@ -222,8 +165,7 @@ def get_specific_analysis_result(conversation_identifier, analysis_type):
     return (
         jsonify(
             {
-                "conversation_id": conversation.id,
-                "file_id": conversation.file_id,
+                "file_id": file_id,
                 "analysis_type_requested": analysis_type,
                 "analysis_type_found": actual_key_found,
                 "data": specific_result,
@@ -236,40 +178,41 @@ def get_specific_analysis_result(conversation_identifier, analysis_type):
 # --- Task Management Endpoints (rely on app error handlers) ---
 @analysis_bp.route("/api/analyze/<file_id>", methods=["POST"])
 def start_analysis_task(file_id):
-    if ".." in file_id or "/" in file_id:
+    if ".." in file_id or "/" in file_id: # Basic check, consider more robust validation
         abort(400, description="Invalid file_id format.")
 
-    conversation = Conversation.query.filter_by(file_id=file_id).first()
-    if not conversation:
-        abort(404, description=f"Conversation with file_id: {file_id} not found.")
+    redis_client = current_app.redis_client
+    meta_key = f"filemeta:{file_id}"
+    metadata = redis_client.hgetall(meta_key)
 
+    if not metadata:
+        abort(404, description=f"File metadata for file_id: {file_id} not found in Redis.")
+
+    current_status = metadata.get("status")
     force_analysis = request.args.get("force", "false").lower() == "true"
+
     if (
-        conversation.status
-        in [
-            "PROCESSING",
-            "PENDING_ANALYSIS",
-            "COMPLETED",
-            "COMPLETED_WITH_ERRORS",
-        ]
+        current_status in ["PROCESSING", "PENDING_ANALYSIS", "COMPLETED", "COMPLETED_WITH_ERRORS"]
         and not force_analysis
     ):
         abort(
             409,
-            description="Analysis for this file is already processing or completed. Use ?force=true to re-analyze.",
+            description=(
+                f"Analysis for this file is status: {current_status}. "
+                "Use ?force=true to re-analyze."
+            ),
         )
 
     task = run_full_analysis.delay(file_id)
-    conversation.celery_task_id = task.id
-    conversation.status = "PENDING_ANALYSIS"
-    try:
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        current_app.logger.error(f"DB error in start_analysis_task: {e}", exc_info=True)
-        abort(
-            500, description="Failed to update conversation status for analysis task."
-        )
+
+    # Update Redis with task ID and new status
+    redis_client.hmset(meta_key, {"celery_task_id": task.id, "status": "PENDING_ANALYSIS"})
+    # Store task_id to file_id mapping
+    redis_client.set(f"task_to_fileid:{task.id}", file_id, ex=current_app.config["REDIS_CACHE_TTL_SECONDS"])
+
+    # Re-apply TTL to meta_key if needed (hmset doesn't clear it but good practice if fields are critical)
+    redis_client.expire(meta_key, current_app.config["REDIS_CACHE_TTL_SECONDS"])
+
 
     return (
         jsonify(
@@ -277,7 +220,6 @@ def start_analysis_task(file_id):
                 "message": "Analysis task started.",
                 "task_id": task.id,
                 "file_id": file_id,
-                "conversation_id": conversation.id,
                 "status_url": url_for(
                     "analysis_bp.get_task_status", task_id=task.id, _external=True
                 ),
@@ -292,26 +234,28 @@ def start_analysis_task(file_id):
 
 @analysis_bp.route("/api/analysis_status/<task_id>", methods=["GET"])
 def get_task_status(task_id):
-    conversation = Conversation.query.filter_by(celery_task_id=task_id).first()
-    db_status = conversation.status.value if conversation else "TASK_ID_NOT_IN_DB"
-
-    # Check Celery task state
+    redis_client = current_app.redis_client
     celery_task = AsyncResult(task_id, app=current_app.extensions["celery"])
     celery_state = celery_task.state
 
     response = {
         "task_id": task_id,
         "celery_state": celery_state,
-        "db_conversation_status": db_status,
     }
 
-    if conversation and conversation.status in [
-        "COMPLETED",
-        "COMPLETED_WITH_ERRORS",
-        "FAILED",
-    ]:
-        response["authoritative_status"] = db_status
-        response["status_message"] = f"Final status from DB: {db_status}"
+    # Try to get file_id and its status from Redis
+    file_id = redis_client.get(f"task_to_fileid:{task_id}")
+    redis_file_status = None
+    if file_id:
+        response["file_id"] = file_id
+        file_meta = redis_client.hgetall(f"filemeta:{file_id}")
+        if file_meta and "status" in file_meta:
+            redis_file_status = file_meta["status"]
+            response["redis_file_status"] = redis_file_status
+
+    if redis_file_status and redis_file_status in ["COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"]:
+        response["authoritative_status"] = redis_file_status
+        response["status_message"] = f"Final status from Redis: {redis_file_status}"
     elif celery_state == "PENDING":
         response["status_message"] = "Task is waiting."
     elif celery_state in ["STARTED", "PROGRESS"]:
@@ -319,12 +263,20 @@ def get_task_status(task_id):
         if celery_task.info and isinstance(celery_task.info, dict):
             response["progress"] = celery_task.info
     elif celery_state == "SUCCESS":
+        # Celery task is done, but processing in run_full_analysis might still be updating Redis status
         response["status_message"] = (
-            "Celery task success. DB should reflect final state."
+            "Celery task processing completed. Check redis_file_status for final application status."
         )
     elif celery_state == "FAILURE":
         response["status_message"] = "Celery task failed."
-        response["error_info_celery"] = str(celery_task.info)
+        response["error_info_celery"] = str(celery_task.info) # Could be an exception string
+        # If Celery task failed, it's possible the file status in Redis wasn't updated to FAILED yet
+        if redis_file_status != "FAILED" and file_id: # Check if we have file_id
+             # Attempt to update filemeta status to FAILED if Celery reports failure
+             # This is a best-effort, actual failure handling should be in the task itself.
+             # redis_client.hset(f"filemeta:{file_id}", "status", "FAILED")
+             # response["redis_file_status_updated_to_failed"] = True
+             pass # Decided against auto-updating here to keep GET idempotent
     else:
         response["status_message"] = f"Task state: {celery_state}."
 
@@ -333,40 +285,49 @@ def get_task_status(task_id):
 
 @analysis_bp.route("/api/analysis_result/<task_id>", methods=["GET"])
 def get_task_result(task_id):
-    conversation = Conversation.query.filter_by(celery_task_id=task_id).first()
-    if not conversation:
-        abort(404, description=f"No conversation found for task_id: {task_id}.")
+    redis_client = current_app.redis_client
+    file_id = redis_client.get(f"task_to_fileid:{task_id}")
 
-    if conversation.status not in [
-        "COMPLETED",
-        "COMPLETED_WITH_ERRORS",
-        "FAILED",
-    ]:
-        celery_task = AsyncResult(task_id, app=current_app.extensions["celery"])
+    if not file_id:
+        # Fallback: Check if task_id itself might be a file_id for older/direct calls (optional)
+        # For now, strictly rely on task_to_fileid mapping
+        # Could also iterate all filemeta:* and check celery_task_id if critical, but inefficient.
+        abort(404, description=f"Mapping for task_id {task_id} to file_id not found or expired.")
+
+    meta_key = f"filemeta:{file_id}"
+    result_key = f"analysisresult:{file_id}"
+
+    file_meta = redis_client.hgetall(meta_key)
+    if not file_meta:
+        abort(404, description=f"File metadata for file_id {file_id} (from task_id {task_id}) not found.")
+
+    current_status = file_meta.get("status")
+    if current_status not in ["COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"]: # FAILED tasks might still have partial results if task logic saves them before failing
+        celery_task_state = AsyncResult(task_id, app=current_app.extensions["celery"]).state
         return (
             jsonify(
-                message="Analysis not yet complete or results unavailable.",
+                message="Analysis not yet complete or results are not in a final state.",
                 task_id=task_id,
-                db_status=conversation.status.value,
-                celery_state=celery_task.state,
+                file_id=file_id,
+                current_file_status=current_status,
+                celery_task_state=celery_task_state,
             ),
-            202,
+            202, # Accepted, but not ready
         )
 
-    analysis_result_record = AnalysisResult.query.filter_by(
-        conversation_id=conversation.id
-    ).first()
-    if not analysis_result_record:
-        abort(404, description="Analysis result record not found.")
+    result_json_str = redis_client.get(result_key)
+    if not result_json_str:
+        # This could happen if task failed before saving results but status is COMPLETED/FAILED
+        abort(404, description=f"Analysis result data for file_id {file_id} (task_id {task_id}) not found in Redis.")
 
+    analysis_output = json.loads(result_json_str)
     return (
         jsonify(
             {
                 "task_id": task_id,
-                "file_id": conversation.file_id,
-                "conversation_id": conversation.id,
-                "final_db_status": conversation.status.value,
-                "analysis_output": analysis_result_record.data,
+                "file_id": file_id,
+                "final_file_status": current_status, # Status from filemeta
+                "analysis_output": analysis_output, # Content from analysisresult:{file_id}
             }
         ),
         200,

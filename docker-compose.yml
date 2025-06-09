@@ -1,24 +1,4 @@
 services:
-  db:
-    image: postgres:13-alpine
-    volumes:
-      - postgres_data:/var/lib/postgresql/data/
-    ports:
-      - '5432:5432'
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER:-convolens_user}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-convolens_pass}
-      - POSTGRES_DB=${POSTGRES_DB:-convolens_db}
-    healthcheck:
-      test:
-        [
-          'CMD-SHELL',
-          'pg_isready -U ${POSTGRES_USER:-convolens_user} -d ${POSTGRES_DB:-convolens_db}',
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   redis:
     image: redis:6-alpine
     ports:
@@ -40,12 +20,9 @@ services:
     environment:
       - FLASK_ENV=${FLASK_ENV:-development}
       - FLASK_DEBUG=${FLASK_DEBUG:-1}
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-convolens_user}:${POSTGRES_PASSWORD:-convolens_pass}@db:5432/${POSTGRES_DB:-convolens_db}
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
     depends_on:
-      db:
-        condition: service_healthy
       redis:
         condition: service_healthy
 
@@ -56,15 +33,11 @@ services:
       - .:/app
       - uploads_data:/app/uploads
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-convolens_user}:${POSTGRES_PASSWORD:-convolens_pass}@db:5432/${POSTGRES_DB:-convolens_db}
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
     depends_on:
-      db:
-        condition: service_healthy
       redis:
         condition: service_healthy
 
 volumes:
-  postgres_data:
   uploads_data:

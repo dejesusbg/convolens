@@ -1,13 +1,13 @@
 from celery import Celery  # type: ignore
 
 # TODO: Configuration should ideally come from Flask app config
-CELERY_BROKER_URL = "redis://localhost:6379/0"
-CELERY_RESULT_BACKEND = "redis://localhost:6379/0"
+broker_url = "redis://localhost:6379/0"
+result_backend = "redis://localhost:6379/0"
 
 celery = Celery(
     __name__,
-    broker=CELERY_BROKER_URL,
-    backend=CELERY_RESULT_BACKEND,
+    broker=broker_url,
+    backend=result_backend,
     include=["app.tasks"],
 )  # Point to where tasks are defined
 
@@ -17,14 +17,14 @@ celery.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
-    # Optional: Add a task time limit
-    # task_time_limit=300, # 5 minutes
+    result_backend=result_backend,  # Explicitly specify the backend here again
+    broker_url=broker_url,  # Explicitly specify the broker URL here again
 )
 
 
 # Optional: If you want to integrate Celery configuration with Flask's config
 def init_celery(app):
-    celery.conf.update(app.config)
+    # celery.conf.update(app.config)
 
     # Subclass Task to automatically push Flask app context
     class ContextTask(celery.Task):

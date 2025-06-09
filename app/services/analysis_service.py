@@ -3,7 +3,6 @@ import json
 import csv
 from collections import Counter, defaultdict
 import os
-
 import text2emotion as te  # type: ignore
 
 
