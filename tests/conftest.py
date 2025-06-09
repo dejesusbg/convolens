@@ -1,79 +1,59 @@
-import pytest  # type: ignore
+import pytest # type: ignore
+import fakeredis # type: ignore
 from app.app import create_app
-from app.models import db, Conversation, AnalysisResult
+# from app.models import db, Conversation, AnalysisResult # Removed DB models
 import os
 import tempfile
-from io import BytesIO
+# from io import BytesIO # BytesIO not used directly here, can be removed if not needed by other fixtures
 
 
 @pytest.fixture(scope="session")
 def app():
     """Session-wide test Flask app."""
-    # Use a temporary SQLite DB for testing to avoid interfering with dev DB
-    # And to ensure a clean state for each test session (or module/function).
-    # For simplicity in this subtask, we'll override the SQLALCHEMY_DATABASE_URI.
-    # A more robust setup might involve a separate config file for testing.
-
-    # Create a temporary file for the SQLite database
-    # db_fd, db_path = tempfile.mkstemp(suffix='.sqlite')
-    # print(f"Using test database: {db_path}")
-
-    # Forcing SQLite in memory for tests for speed and isolation
-    # Note: Some PostgreSQL specific features like JSONB might behave differently or not be available.
-    # For true integration tests, a test PostgreSQL instance is better.
-    # For now, this focuses on unit/functional tests of Flask logic.
-    # Using a file-based SQLite for persistence across test client requests if needed.
-
-    # Using a named temporary file for SQLite
-    # This ensures it has a path that can be used by SQLAlchemy
-    # temp_db_file = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False)
-    # test_db_url = f"sqlite:///{temp_db_file.name}"
-    # temp_db_file.close() # Close it so SQLAlchemy can open it
-
-    # Simplest for now: in-memory SQLite. This won't persist across different parts of tests
-    # if they re-initialize app, but for a single test client session it's fine.
-    # For tests involving Celery tasks that run out-of-process, this won't work well
-    # as the worker won't see the in-memory DB.
-    # Given the current scope, let's try file-based temp SQLite.
-
-    # Create a temporary directory for the instance folder and SQLite DB
-    temp_dir = tempfile.TemporaryDirectory()
-    instance_path = os.path.join(temp_dir.name, "instance")
-    os.makedirs(instance_path, exist_ok=True)
-    test_db_path = os.path.join(instance_path, "test.sqlite")
-    test_db_url = f"sqlite:///{test_db_path}"
-
     flask_app = create_app()  # Create app using your factory
+
+    # Configure a temporary directory for uploads for the test session
+    upload_temp_dir = tempfile.TemporaryDirectory()
+
     flask_app.config.update(
         {
             "TESTING": True,
-            "SQLALCHEMY_DATABASE_URI": test_db_url,
-            "CELERY_BROKER_URL": "memory://",  # Use in-memory broker for Celery for tests (if tasks are tested directly)
-            "CELERY_RESULT_BACKEND": "cache+memory://",  # Or use a test Redis if available/mocked
-            "UPLOAD_FOLDER": tempfile.mkdtemp(),  # Temporary upload folder
+            # "SQLALCHEMY_DATABASE_URI": test_db_url, # Removed DB config
+            "CELERY_BROKER_URL": "memory://",  # Use in-memory broker for Celery
+            "CELERY_RESULT_BACKEND": "cache+memory://", # Use in-memory result backend for Celery
+            "UPLOAD_FOLDER": upload_temp_dir.name, # Use the temp dir for uploads
             "SERVER_NAME": "localhost.test",  # For url_for to work without active request context
+            "REDIS_CACHE_TTL_SECONDS": 3600 # Example TTL for tests
         }
     )
 
-    # print(f"App config during test setup: {flask_app.config}")
+    # Initialize fakeredis and patch the app's redis_client
+    # This single instance will be shared across the test session.
+    # For test isolation at the function level, this could be a function-scoped fixture.
+    # However, app context setup usually happens once per session for efficiency.
+    # Individual tests can clear redis if needed: `app.redis_client.flushall()`
+    fake_redis_client = fakeredis.FakeStrictRedis(decode_responses=True) # Matched decode_responses with app
+    flask_app.redis_client = fake_redis_client
 
-    with flask_app.app_context():
-        db.create_all()  # Create tables in the test DB
+    # print(f"App config during test setup: {flask_app.config}")
+    # print(f"Using fakeredis client: {flask_app.redis_client}")
+
+
+    # No db.create_all() needed
+    # with flask_app.app_context():
+    #     db.create_all()
 
     yield flask_app  # Provide the app object to tests
 
-    # Teardown: clean up the temporary database file and directory
-    # os.close(db_fd)
-    # os.unlink(db_path)
-    # os.unlink(temp_db_file.name) # Remove the named temporary file
-    # if os.path.exists(test_db_path):
-    #    os.unlink(test_db_path)
-    temp_dir.cleanup()  # Cleans up the directory and its contents
+    # Teardown: clean up the temporary upload directory
+    upload_temp_dir.cleanup()
 
 
 @pytest.fixture()
 def client(app):
     """A test client for the app."""
+    # Ensure redis is clean before each test that uses the client if needed
+    # app.redis_client.flushall() # Add this if tests interfere via Redis state
     return app.test_client()
 
 
@@ -83,15 +63,12 @@ def runner(app):
     return app.test_cli_runner()
 
 
+# Removed clean_db fixture as it was DB specific.
+# If Redis needs cleaning per test, it can be done in client fixture or individual tests.
+# Example of a fixture to provide a clean redis client for each test:
 @pytest.fixture(scope="function")
-def clean_db(app):
-    """Clean database tables before each test function that needs it."""
-    with app.app_context():
-        # This is a simple way to clean. For more complex scenarios,
-        # database transaction rollbacks or tools like pytest-postgresql might be used.
-        # For SQLite, deleting and recreating is often fast enough.
-        db.session.remove()
-        db.drop_all()
-        db.create_all()
-    yield  # Test runs here
-    # Optional: any post-test cleanup specific to this fixture if needed
+def redis_client(app):
+    """Provides a clean fakeredis client for each test function."""
+    # app.redis_client is the session-wide client from the app fixture
+    app.redis_client.flushall() # Clear before each test
+    return app.redis_client

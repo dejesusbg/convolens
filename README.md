@@ -13,8 +13,8 @@ The **primary aim** of Convolens is to empower researchers, analysts, and busine
 - **Input**: JSON or TXT transcripts with speaker tags.
 - **Core Analysis**: Speaker identification, persuasion scoring, emotion detection, logical fallacy detection, and manipulation highlighting.
 - **Visualization**: Interactive influence graphs, time-series emotion/persuasion trends, and annotated transcripts.
-- **Architecture**: Next.js + React (frontend), Python Flask (backend), and a modular AI/ML pipeline using TensorFlow/Keras and Hugging Face models.
-- **Data**: User-uploaded transcripts, with optional pre-labeled corpora for model fine-tuning.
+- **Architecture**: Next.js + React (frontend), Python Flask (backend), and a modular AI/ML pipeline using TensorFlow/Keras and Hugging Face models. Redis is used for Celery and temporary caching of job data and results.
+- **Data**: User-uploaded transcripts, with optional pre-labeled corpora for model fine-tuning. All uploaded data and analysis results are stored temporarily and subject to cache expiry.
 - **Extensibility**: Includes continuous training workflows, research modules, and pluggable detectors.
 
 ## 3. Expected Outcomes & Release Plan
@@ -111,7 +111,8 @@ Comprehensive documentation and research outputs will include:
 - **Language/Framework**: Python 3.13+ with Flask.
 - **ASGI Server**: Uvicorn + Gunicorn.
 - **Asynchronous Tasks**: Celery + Redis.
-- **Databases**: PostgreSQL (metadata) + MinIO or S3 (file storage).
+- **Caching & Temporary Storage**: Redis (for file metadata, analysis results, and Celery).
+- **File Storage (Optional/Future)**: MinIO or S3 (for persistent file storage, not currently implemented for primary data).
 
 ### AI/ML Pipeline
 
@@ -124,6 +125,29 @@ Comprehensive documentation and research outputs will include:
 - **Local Development**: Docker Compose.
 - **Production**: Kubernetes (EKS/GKE).
 - **CI/CD**: GitHub Actions for build, test, and deploy.
+
+## Prerequisites / Setup (Local Development)
+
+To run Convolens locally using Docker Compose, you will need:
+- Docker
+- Docker Compose
+
+The `docker-compose.yml` will set up the following services:
+- `web`: The Flask backend application.
+- `worker`: The Celery worker for asynchronous analysis tasks.
+- `redis`: The Redis instance used by Celery and for caching.
+- (Previously `db`: PostgreSQL - This has been removed).
+
+## Configuration
+
+Key environment variables (can be set in `.env` file for local Docker Compose, or in your deployment environment):
+
+- `FLASK_ENV`: Set to `development` or `production`.
+- `CELERY_BROKER_URL`: URL for the Celery message broker (e.g., `redis://redis:6379/0`).
+- `CELERY_RESULT_BACKEND`: URL for the Celery result backend (e.g., `redis://redis:6379/0`).
+- `REDIS_CACHE_TTL_SECONDS`: (New) Time-To-Live in seconds for cached items in Redis. Default: `600` (10 minutes).
+- (Removed) `DATABASE_URL`: No longer used.
+- (Removed) `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`: No longer used.
 
 ## 7. AI/ML Components & Data Strategy
 

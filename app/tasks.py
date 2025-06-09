@@ -9,55 +9,34 @@ from .services.analysis_service import (
     calculate_persuasion_scores_heuristic,
     detect_fallacies_and_manipulation_heuristic,
 )
-from .models import db, Conversation, AnalysisResult
+import redis # type: ignore
+import json # type: ignore
 
 
 @celery.task(bind=True)
 def run_full_analysis(self, file_id):
     """
-    Celery task to run the full analysis pipeline and save results to DB.
+    Celery task to run the full analysis pipeline and save results to Redis.
     """
-    # App context should be available due to ContextTask in celery_app.py
-    conversation = Conversation.query.filter_by(file_id=file_id).first()
+    redis_client = current_app.redis_client
+    meta_key = f"filemeta:{file_id}"
+    result_key = f"analysisresult:{file_id}"
 
-    if not conversation:
-        # This case should ideally be prevented by checks before dispatching
-        self.update_state(
-            state="FAILURE",
-            meta={
-                "exc_type": "ValueError",
-                "exc_message": f"Conversation record not found for file_id: {file_id}",
-            },
-        )
-        # No db record to update status on here if it's missing.
-        return {
-            "error": f"Conversation record not found for file_id: {file_id}",
-            "status": "FAILURE_DB_ERROR",
-        }
+    file_metadata = redis_client.hgetall(meta_key)
 
-    # Update conversation status to PROCESSING
-    conversation.celery_task_id = self.request.id  # Store Celery task ID
-    conversation.status = "PROCESSING"
-    try:
-        db.session.commit()
-    except Exception as e_db_commit:
-        db.session.rollback()
-        # Log this critical error
-        self.update_state(
-            state="FAILURE",
-            meta={
-                "exc_type": str(type(e_db_commit)),
-                "exc_message": f"DB error updating status: {str(e_db_commit)}",
-            },
-        )
-        return {"error": f"DB error: {str(e_db_commit)}", "status": "FAILURE_DB_ERROR"}
+    if not file_metadata:
+        self.update_state(state="FAILURE", meta={"exc_type": "ValueError", "exc_message": f"File metadata not found in Redis for file_id: {file_id} (possibly expired)"})
+        return {"error": f"File metadata not found for file_id: {file_id}", "status": "FAILURE_METADATA_NOT_FOUND"}
+
+    redis_client.hmset(meta_key, {"status": "PROCESSING", "celery_task_id": self.request.id})
+    # Re-apply TTL if needed, though updating fields doesn't clear it. Consider if TTL should be extended.
+    redis_client.expire(meta_key, current_app.config["REDIS_CACHE_TTL_SECONDS"])
 
     upload_folder = current_app.config.get("UPLOAD_FOLDER", "uploads")
     filepath = os.path.join(upload_folder, file_id)
 
     if not os.path.exists(filepath):
-        conversation.status = "FAILED"  # File gone missing after upload
-        db.session.commit()
+        redis_client.hset(meta_key, "status", "FAILED")
         self.update_state(
             state="FAILURE",
             meta={
@@ -71,7 +50,7 @@ def run_full_analysis(self, file_id):
         }
 
     # --- Analysis Pipeline ---
-    results_payload = {}  # This will store the 'results' dict for AnalysisResult.data
+    results_payload = {}
     errors_list = []
     total_steps = 5
 
@@ -167,65 +146,28 @@ def run_full_analysis(self, file_id):
 
     # Determine final status and save results
     task_final_status_for_celery_result = ""
+    final_status_for_redis = ""
     if errors_list:
-        conversation.status = "COMPLETED_WITH_ERRORS"
+        final_status_for_redis = "COMPLETED_WITH_ERRORS"
         task_final_status_for_celery_result = "COMPLETED_WITH_ERRORS"
     else:
-        conversation.status = "COMPLETED"
+        final_status_for_redis = "COMPLETED"
         task_final_status_for_celery_result = "SUCCESS"
 
-    # Create or update AnalysisResult
-    # The entire task output (status, results_payload, errors_list) will be stored in AnalysisResult.data
-    final_data_for_db = {
+    final_data_for_storage = {
         "task_status_reported": task_final_status_for_celery_result,
         "results": results_payload,
         "errors": errors_list,
+        "file_id": file_id # Include file_id for clarity
     }
 
-    existing_analysis_result = AnalysisResult.query.filter_by(
-        conversation_id=conversation.id
-    ).first()
-    if existing_analysis_result:
-        existing_analysis_result.data = final_data_for_db
-    else:
-        new_analysis_result = AnalysisResult(
-            conversation_id=conversation.id, data=final_data_for_db
-        )
-        db.session.add(new_analysis_result)
+    redis_client.set(result_key, json.dumps(final_data_for_storage))
+    redis_client.expire(result_key, current_app.config["REDIS_CACHE_TTL_SECONDS"])
+    redis_client.hset(meta_key, "status", final_status_for_redis)
 
-    try:
-        db.session.commit()
-    except Exception as e_db_final_commit:
-        db.session.rollback()
-        # This is a critical failure to save results
-        # Mark conversation as failed if results cannot be saved
-        conversation.status = "FAILED"
-        try:
-            db.session.commit()  # Try to commit the FAILED status at least
-        except:
-            db.session.rollback()  # Give up if even that fails
-
-        self.update_state(
-            state="FAILURE",
-            meta={
-                "exc_type": str(type(e_db_final_commit)),
-                "exc_message": f"DB error saving results: {str(e_db_final_commit)}",
-            },
-        )
-        return {
-            "error": f"DB error saving results: {str(e_db_final_commit)}",
-            "status": "FAILURE_DB_SAVE_RESULT",
-        }
-
-    # This is the return value for Celery's own result backend (e.g., Redis)
-    # Adding conversation_id to the celery task result for easier tracking if needed from celery directly
     return {
         "status": task_final_status_for_celery_result,
-        "conversation_id": conversation.id,
-        "analysis_result_db_id": (
-            existing_analysis_result.id
-            if existing_analysis_result
-            else new_analysis_result.id
-        ),
+        "file_id": file_id, # Changed from conversation_id
+        "analysis_result_key_redis": result_key, # Instead of db_id
         "errors_count": len(errors_list),
     }
