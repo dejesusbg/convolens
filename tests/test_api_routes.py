@@ -4,7 +4,7 @@ from app.models import Conversation, db  # Import models
 
 
 def test_health_check(client):
-    response = client.get("/health")
+    response = client.get("/api/health")
     assert response.status_code == 200
     json_data = response.get_json()
     assert json_data["status"] == "OK"

@@ -6,7 +6,7 @@ from flask_cors import CORS  # type: ignore
 from flask_talisman import Talisman  # type: ignore
 from sqlalchemy import text  # type: ignore
 from .celery_app import init_celery
-from .models import db, Conversation
+from .models import db, migrate, Conversation
 
 ALLOWED_EXTENSIONS = {"txt", "json", "csv"}
 SUPPORTED_LANGUAGES = ["en", "es"]
@@ -68,10 +68,8 @@ def create_app(config_name=None):
 
     # --- Initialize Extensions ---
     db.init_app(app)
+    migrate.init_app(app, db)
     init_celery(app)
-
-    with app.app_context():
-        db.create_all()
 
     # --- Error Handling ---
     @app.errorhandler(400)
@@ -113,7 +111,7 @@ def create_app(config_name=None):
         )
 
     # --- Routes ---
-    @app.route("/health")
+    @app.route("/api/health")
     def health():
         try:
             db.session.execute(text("SELECT 1"))

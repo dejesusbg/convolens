@@ -32,7 +32,7 @@ Specific error codes are documented per endpoint. Common ones include:
 
 ### 1. Health Check
 
-- **Endpoint:** \`GET /health\`
+- **Endpoint:** \`GET /api/health\`
 - **Description:** Checks the health of the application and its database connection.
 - **Request:** None
 - **Success Response (200 OK):**
@@ -215,7 +215,7 @@ Specific error codes are documented per endpoint. Common ones include:
 - **Success Response (200 OK):**
   \`\`\`json
   {
-  "task_id": "celery-task-uuid",
+  "task*id": "celery-task-uuid",
   "file_id": "generated-uuid-filename.ext",
   "conversation_id": 123,
   "final_db_status": "COMPLETED", // e.g., COMPLETED, COMPLETED_WITH_ERRORS
@@ -223,11 +223,11 @@ Specific error codes are documented per endpoint. Common ones include:
   // This is the structure saved by the Celery task into AnalysisResult.data
   "task_status_reported": "SUCCESS", // or "COMPLETED_WITH_ERRORS"
   "results": {
-  "speaker_statistics": { /_ ... _/ },
+  "speaker_statistics": { /* ... _/ },
   "emotion_analysis": { /_ ... _/ },
   "persuasion_analysis": { /_ ... _/ },
   "tactic_detection": { /_ ... _/ },
-  "influence_graph": { /_ ... _/ }
+  "influence_graph": { /_ ... \_/ }
   },
   "errors": [ /* list of error strings if any occurred during sub-analyses */ ]
   }

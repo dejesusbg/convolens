@@ -47,7 +47,9 @@ def list_conversations():
         query = query.filter(Conversation.language == lang_filter.lower())
 
     try:
-        paginated_conversations = query.paginate(page, per_page, error_out=False)
+        paginated_conversations = query.paginate(
+            page=page, per_page=per_page, error_out=False
+        )
     except Exception as e:  # Catch potential pagination errors not covered by aborts
         current_app.logger.error(f"Pagination query error: {e}")
         abort(500, description="Error during data retrieval.")
@@ -57,7 +59,7 @@ def list_conversations():
             "id": c.id,
             "file_id": c.file_id,
             "original_filename": c.original_filename,
-            "status": c.status.value if c.status else None,
+            "status": c.status if c.status else None,
             "language": c.language,
             "upload_timestamp": (
                 c.upload_timestamp.isoformat() if c.upload_timestamp else None

@@ -1,8 +1,10 @@
 from flask_sqlalchemy import SQLAlchemy  # type: ignore
 from sqlalchemy.dialects.postgresql import JSONB  # type: ignore
+from flask_migrate import Migrate  # type: ignore
 from datetime import datetime
 
 db = SQLAlchemy()
+migrate = Migrate()
 
 # class ConversationStatus(enum.Enum):
 #     UPLOADED = "UPLOADED"
